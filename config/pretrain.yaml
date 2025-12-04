@@ -1,0 +1,21 @@
+data:
+  input_dir: "datasets/owls_align_pretrain"
+  output_dir: "graphs"
+
+model:
+  input_text_dim: 768
+  hidden_dim: 256
+  gnn_type: "rgcn"
+  num_relations: 8
+  num_domains: 8
+  weights:
+    edge: 1.0
+    recon: 1.0
+    contrast: 0.1
+    cross_graph: 0.5
+
+train:
+  batch_size: 4
+  epochs: 400
+  lr: 1e-4
+

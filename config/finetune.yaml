@@ -1,0 +1,47 @@
+data:
+  input_dir: "datasets/owls_align_pretrain"
+  output_dir: "graphs"
+  src_graph: "graphs/human.pt" 
+  tgt_graph: "graphs/mouse.pt" 
+  pair_file: "datasets/oaei_anatomy/reference.rdf"
+  
+model:
+  pretrained_path: "checkpoints/pretrained_model_epoch_400.pt"
+  hidden_dim: 256
+  gnn_type: "rgcn"
+  num_relations: 8
+  num_domains: 8
+  input_text_dim: 768
+
+train:
+  lr: 2e-4
+  epochs: 500
+  batch_size: 16 
+  accumulation_steps: 4
+  k_hop: 2
+  threshold: 0.8 # For pseudo-labels
+  min_seed_pairs: 500 # Minimum number of seed pairs for warmup
+  csls_threshold: 0.5
+  structure_threshold: 0.05
+  high_conf_topk: 100
+  max_new_pairs: 200
+  min_precision_to_expand: 0.88
+  csls_adaptive: true
+  csls_std_multiplier: 1.5
+  csls_min_threshold: 0.1
+  csls_max_pairs_per_round: 2000
+  csls_min_pairs_per_round: 25
+  high_conf_min_score: 0.3
+  high_conf_margin: 0.05
+  high_conf_max_pairs_per_round: 1000
+  warmup_rounds: 3
+  embedding_topk: 50
+  embedding_score_threshold: 0.5
+  embedding_max_pairs_per_round: 200
+  embedding_margin: 0.1
+  anchor_prune_threshold: 0.6
+  anchor_replace_margin: 0.02
+  lexical_override_threshold: 0.75
+  lexical_guard_rounds: 2
+  lexical_min_hits: 10
+  lexical_min_precision: 0.95

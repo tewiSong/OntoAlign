@@ -1,0 +1,6 @@
+*.err
+*.out
+datasets/
+dcgm/
+graphs/
+checkpoints/pretrained_model_epoch_200.pt
