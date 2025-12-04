@@ -49,6 +49,8 @@ class OntologyGraphDataset(Dataset):
 
         data = Data()
         data.x_text = x_text
+        if "x_path" in graph:
+            data.x_path = self._to_tensor(graph["x_path"], dtype=torch.float32)
         data.edge_index = edge_index
         data.edge_type = edge_type
         data.edge_property_id = self._load_edge_property_ids(graph)

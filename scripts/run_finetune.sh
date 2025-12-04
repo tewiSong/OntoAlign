@@ -7,7 +7,7 @@
 #SBATCH --time=1:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --mem=250G
-#SBATCH --constraint=a100
+#SBATCH --constraint=a100|v100
 
 #run the application:
 module purge

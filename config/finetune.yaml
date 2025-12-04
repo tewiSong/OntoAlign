@@ -10,7 +10,7 @@ model:
   hidden_dim: 256
   gnn_type: "rgcn"
   num_relations: 8
-  num_domains: 8
+  num_domains: 24
   input_text_dim: 768
 
 train:

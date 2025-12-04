@@ -35,6 +35,7 @@ class OntoAlignEncoder(nn.Module):
         
         # Text projection
         self.text_proj = nn.Linear(text_dim, hidden_dim)
+        self.path_proj = nn.Linear(text_dim, hidden_dim)
         
         # Domain embeddings (Tokens)
         self.domain_emb = nn.Embedding(num_domains, hidden_dim)
@@ -54,6 +55,23 @@ class OntoAlignEncoder(nn.Module):
         
         # LoRA Layers (parallel to GNN)
         self.lora_layers = nn.ModuleList() if use_lora else None
+
+        # Gated fusion modules for path + semantic features and semantic + structural features
+        self.path_fusion_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.path_gate_network = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        self.semantic_gate_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.structural_gate_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.gate_network = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
         
         for _ in range(num_layers):
             if gnn_type == 'rgat':
@@ -65,7 +83,7 @@ class OntoAlignEncoder(nn.Module):
             if use_lora:
                 self.lora_layers.append(LoRALayer(hidden_dim, hidden_dim, rank=lora_rank))
                 
-    def forward(self, x_text, edge_index, edge_type, batch, domain_ids, domain_emb_input=None, edge_property_id=None):
+    def forward(self, x_text, edge_index, edge_type, batch, domain_ids, domain_emb_input=None, edge_property_id=None, x_path=None):
         """
         Args:
             x_text: [N, text_dim] - Node text features
@@ -81,6 +99,9 @@ class OntoAlignEncoder(nn.Module):
         
         # 1. Project text features
         h = self.text_proj(x_text) # [N, hidden_dim]
+        path_ctx = None
+        if x_path is not None:
+            path_ctx = self.path_proj(x_path)
         
         # 2. Get Domain Tokens
         if domain_emb_input is not None:
@@ -99,13 +120,27 @@ class OntoAlignEncoder(nn.Module):
         
         # MDGPT: h_hat = t_s * h_tilde
         h = h * d_emb_nodes
-
+        if path_ctx is not None:
+            if path_ctx.size(0) != h.size(0):
+                raise ValueError("x_path must align with x_text along node dimension.")
+            path_ctx = path_ctx * d_emb_nodes
+            path_ctx = self.path_fusion_proj(path_ctx)
+            path_gate_input = torch.cat([h, path_ctx], dim=-1)
+            path_gate = self.path_gate_network(path_gate_input)
+            h = path_gate * h + (1.0 - path_gate) * path_ctx
+        
         if edge_property_id is not None and edge_property_id.numel() == edge_index.size(1):
             h = self._apply_property_prompts(h, edge_index, edge_property_id)
+        semantic_base = h
         
         # 4. GNN Pass
         curr_h = h
-        edge_prop_emb = self._edge_property_message(edge_index, edge_property_id, curr_h.shape[0])
+        edge_prop_emb = self._edge_property_message(
+            edge_index,
+            edge_property_id,
+            curr_h.shape[0],
+            target_dtype=curr_h.dtype
+        )
         for i, conv in enumerate(self.gnn_layers):
             if edge_prop_emb is not None:
                 curr_h = curr_h + edge_prop_emb
@@ -120,6 +155,13 @@ class OntoAlignEncoder(nn.Module):
                 curr_h = F.relu(h_conv + h_lora)
             else:
                 curr_h = F.relu(h_conv)
+
+        # 5. Gated fusion between semantic and structural views
+        semantic_view = self.semantic_gate_proj(semantic_base)
+        structural_view = self.structural_gate_proj(curr_h)
+        gate_input = torch.cat([semantic_view, structural_view], dim=-1)
+        fusion_gate = self.gate_network(gate_input)
+        curr_h = fusion_gate * semantic_view + (1.0 - fusion_gate) * structural_view
         
         return curr_h
 
@@ -134,7 +176,7 @@ class OntoAlignEncoder(nn.Module):
         return torch.mean(h, dim=0, keepdim=True)
 
 
-    def _edge_property_message(self, edge_index, edge_property_id, num_nodes):
+    def _edge_property_message(self, edge_index, edge_property_id, num_nodes, target_dtype=None):
         if edge_property_id is None or edge_property_id.numel() == 0:
             return None
         if edge_property_id.numel() != edge_index.size(1):
@@ -142,11 +184,15 @@ class OntoAlignEncoder(nn.Module):
         prop_ids = edge_property_id.to(self.property_emb.weight.device)
         prop_ids = prop_ids.clamp(0, self.property_emb.num_embeddings - 1)
         edge_prop_embed = self.property_emb(prop_ids)
+        if target_dtype is not None:
+            edge_prop_embed = edge_prop_embed.to(dtype=target_dtype)
         src = edge_index[0]
-        deg = torch.zeros(num_nodes, device=edge_prop_embed.device)
-        deg.index_add_(0, src, torch.ones_like(src, dtype=torch.float32))
+        dtype = edge_prop_embed.dtype
+        device = edge_prop_embed.device
+        deg = torch.zeros(num_nodes, dtype=dtype, device=device)
+        deg.index_add_(0, src, torch.ones_like(src, dtype=dtype))
         deg = deg.clamp(min=1.0).unsqueeze(1)
-        agg_prop = torch.zeros(num_nodes, edge_prop_embed.size(1), device=edge_prop_embed.device)
+        agg_prop = torch.zeros(num_nodes, edge_prop_embed.size(1), dtype=dtype, device=device)
         agg_prop.index_add_(0, src, edge_prop_embed)
         return agg_prop / deg
 
@@ -156,17 +202,18 @@ class OntoAlignEncoder(nn.Module):
         prop_ids = edge_property_id.to(h.device)
         prop_ids = prop_ids.clamp(0, self.property_emb.num_embeddings - 1)
         prop_emb = self.property_emb(prop_ids)
+        prop_emb = prop_emb.to(dtype=h.dtype)
         if prop_emb.numel() == 0:
             return h
         src = edge_index[0]
         prop_aggr = torch.zeros_like(h)
         prop_aggr.index_add_(0, src, prop_emb)
-        deg = torch.zeros(h.size(0), device=h.device)
-        deg.index_add_(0, src, torch.ones_like(src, dtype=torch.float32))
+        deg = torch.zeros(h.size(0), dtype=h.dtype, device=h.device)
+        deg.index_add_(0, src, torch.ones_like(src, dtype=h.dtype))
         deg = deg.clamp(min=1.0).unsqueeze(1)
         return h + prop_aggr / deg
 
-    def encode_with_mask(self, x_text, edge_index, edge_type, batch, domain_ids, mask_nodes_idx, edge_property_id=None):
+    def encode_with_mask(self, x_text, edge_index, edge_type, batch, domain_ids, mask_nodes_idx, edge_property_id=None, x_path=None):
         """
         Performs encoding with some nodes masked (e.g. text features zeroed out).
         """
@@ -180,7 +227,8 @@ class OntoAlignEncoder(nn.Module):
             edge_type,
             batch,
             domain_ids,
-            edge_property_id=edge_property_id
+            edge_property_id=edge_property_id,
+            x_path=x_path
         )
 
 

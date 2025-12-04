@@ -2,12 +2,29 @@ data:
   input_dir: "datasets/owls_align_pretrain"
   output_dir: "graphs"
 
+graph:
+  relations:
+    REL_SUBCLASS: 0
+    REL_SUBCLASS_INV: 1
+    REL_EQUIV: 2
+    REL_DISJOINT: 3
+    REL_EXISTS: 4
+    REL_EXISTS_INV: 5
+    REL_FORALL: 6
+    REL_FORALL_INV: 7
+    REL_DOMAIN: 8
+    REL_RANGE: 9
+    REL_DOMAIN_INV: 10
+    REL_RANGE_INV: 11
+    REL_SUBPROP: 12
+    REL_SUBPROP_INV: 13
+
 model:
   input_text_dim: 768
   hidden_dim: 256
   gnn_type: "rgcn"
-  num_relations: 8
-  num_domains: 8
+  num_relations: 14
+  num_domains: 24
   weights:
     edge: 1.0
     recon: 1.0
@@ -15,7 +32,12 @@ model:
     cross_graph: 0.5
 
 train:
-  batch_size: 4
+  batch_size: 1
   epochs: 400
   lr: 1e-4
-
+  use_amp: true
+  contrastive_max_nodes: 128
+  cross_graph_max_pairs: 128
+  cross_graph_hard_neg_k: 10
+  cross_graph_hard_neg_margin: 0.1
+  cross_graph_hard_neg_weight: 0.5

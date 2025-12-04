@@ -3,4 +3,5 @@
 datasets/
 dcgm/
 graphs/
+logs/
 checkpoints/
