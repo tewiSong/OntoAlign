@@ -23,9 +23,13 @@ train:
   min_seed_pairs: 500 # Minimum number of seed pairs for warmup
   csls_threshold: 0.5
   structure_threshold: 0.05
+  structure_min_success: 15
+  structure_relax_factor: 0.5
   high_conf_topk: 100
   max_new_pairs: 200
   min_precision_to_expand: 0.88
+  precision_slack: 0.02
+  precision_patience: 3
   csls_adaptive: true
   csls_std_multiplier: 1.5
   csls_min_threshold: 0.1
@@ -41,7 +45,8 @@ train:
   embedding_margin: 0.1
   anchor_prune_threshold: 0.6
   anchor_replace_margin: 0.02
-  lexical_override_threshold: 0.75
+  lexical_override_threshold: 0.25
+  lexical_replace_min_score: 0.6
   lexical_guard_rounds: 3
   structure_warmup_rounds: 3
   structure_min_anchors: 300

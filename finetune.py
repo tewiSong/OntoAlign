@@ -557,24 +557,24 @@ def get_hard_negatives(z_s, h_t, known_tgt_indices, device, beta=20):
     return h_t[torch.tensor(neg_indices, device=device)]
 
 # --- Hybrid Inference & Evaluation ---
-def evaluate_hybrid(src_graph, tgt_graph, h_src, h_tgt, lexical_seeds, evaluator):
-    if not evaluator: return
-    
-    # 1. Trust Lexical Seeds but allow confident embedding overrides
-    pred_pairs = set(lexical_seeds)
-    lexical_assignments = {s: t for s, t in lexical_seeds}
+def evaluate_hybrid(src_graph, tgt_graph, h_src, h_tgt, anchor_pairs, evaluator):
+    if not evaluator:
+        return
+
+    base_pairs = anchor_pairs if anchor_pairs is not None else []
+    pred_pairs = set(base_pairs)
+    lexical_assignments = {s: t for s, t in base_pairs}
     lexical_tgt = set(lexical_assignments.values())
     lexical_override_margin = 0.05
-    
-    # 2. Retrieve missing using MNN (Strict for Eval)
+
     with torch.no_grad():
         src_emb = F.normalize(h_src, p=2, dim=1)
         tgt_emb = F.normalize(h_tgt, p=2, dim=1)
         sim_matrix = torch.mm(src_emb, tgt_emb.t())
-        
+
         val_s, idx_s = sim_matrix.max(dim=1)
         val_t, idx_t = sim_matrix.max(dim=0)
-        
+
         for i in range(sim_matrix.size(0)):
             j = idx_s[i].item()
             candidate_is_mnn = idx_t[j].item() == i
@@ -602,11 +602,8 @@ def evaluate_hybrid(src_graph, tgt_graph, h_src, h_tgt, lexical_seeds, evaluator
             pred_pairs.add((i, j))
             lexical_assignments[i] = j
             lexical_tgt.add(j)
-    
-    pred_pairs_iri = set()
-    for s, t in pred_pairs:
-        pred_pairs_iri.add((src_graph.node_iris[s], tgt_graph.node_iris[t]))
-        
+
+    pred_pairs_iri = {(src_graph.node_iris[s], tgt_graph.node_iris[t]) for s, t in pred_pairs}
     metrics = evaluator.evaluate(pred_pairs_iri)
     print(f"  [Eval] P={metrics['Precision']:.4f}, R={metrics['Recall']:.4f}, F1={metrics['F1']:.4f}")
     return metrics
@@ -729,9 +726,13 @@ def finetune(config_path="config/finetune.yaml"):
     train_cfg = config.get('train', {})
     csls_threshold = train_cfg.get('csls_threshold', 0.5)
     structure_threshold = train_cfg.get('structure_threshold', 0.05)
+    structure_min_success = train_cfg.get('structure_min_success', 10)
+    structure_relax_factor = train_cfg.get('structure_relax_factor', 0.5)
     high_conf_topk = train_cfg.get('high_conf_topk', 100)
     max_new_pairs = train_cfg.get('max_new_pairs', 200)
     min_precision_to_expand = train_cfg.get('min_precision_to_expand', 0.95)
+    precision_slack = train_cfg.get('precision_slack', 0.0)
+    precision_patience = train_cfg.get('precision_patience', 1)
     csls_adaptive = train_cfg.get('csls_adaptive', True)
     csls_std_multiplier = train_cfg.get('csls_std_multiplier', 1.5)
     csls_min_threshold = train_cfg.get('csls_min_threshold', -0.05)
@@ -747,7 +748,8 @@ def finetune(config_path="config/finetune.yaml"):
     embedding_margin = train_cfg.get('embedding_margin', 0.1)
     anchor_prune_threshold = train_cfg.get('anchor_prune_threshold', 0.6)
     anchor_replace_margin = train_cfg.get('anchor_replace_margin', 0.02)
-    lexical_override_threshold = train_cfg.get('lexical_override_threshold', 0.75)
+    lexical_override_threshold = train_cfg.get('lexical_override_threshold', 0.25)
+    lexical_replace_min_score = train_cfg.get('lexical_replace_min_score', 0.6)
     lexical_guard_rounds = train_cfg.get('lexical_guard_rounds', 3)
     structure_warmup_rounds = train_cfg.get('structure_warmup_rounds', 3)
     structure_min_anchors = train_cfg.get('structure_min_anchors', 300)
@@ -920,13 +922,15 @@ def finetune(config_path="config/finetune.yaml"):
 
     def add_anchor_pair(pair, score, origin):
         s, t = pair
+        if origin != "lexical" and score < lexical_override_threshold:
+            return False
         existing = source_anchor_map.get(s)
         if existing:
             existing_origin = anchor_origin.get(existing)
             if existing_origin == "lexical":
                 if origin == "lexical":
                     return False
-                if (not lexical_override_enabled) or score < lexical_override_threshold:
+                if (not lexical_override_enabled) or score < lexical_replace_min_score:
                     return False
             else:
                 if score <= anchor_score.get(existing, float('-inf')) + anchor_replace_margin:
@@ -938,7 +942,7 @@ def finetune(config_path="config/finetune.yaml"):
             if existing_origin_t == "lexical":
                 if origin == "lexical":
                     return False
-                if (not lexical_override_enabled) or score < lexical_override_threshold:
+                if (not lexical_override_enabled) or score < lexical_replace_min_score:
                     return False
             else:
                 if score <= anchor_score.get(existing_t, float('-inf')) + anchor_replace_margin:
@@ -963,14 +967,18 @@ def finetune(config_path="config/finetune.yaml"):
     for pair in lexical_seeds:
         lexical_add_batch.append(pair)
     flush_lexical_batch(final=True)
+
+    pending_pairs = []
+    last_eval_precision = None
     
     # 6. Zero-shot Eval
     print("\n=== Zero-shot Evaluation (Hybrid) ===")
     model.eval()
     h_src = run_model(model, text_proj, src_graph, device, adapter=src_adapter)
     h_tgt = run_model(model, text_proj, tgt_graph, device, adapter=tgt_adapter)
-    hybrid_metrics = evaluate_hybrid(src_graph, tgt_graph, h_src, h_tgt, lexical_seeds, evaluator)
+    hybrid_metrics = evaluate_hybrid(src_graph, tgt_graph, h_src, h_tgt, current_anchors, evaluator)
     evaluate_embeddings_only(src_graph, tgt_graph, h_src, h_tgt, evaluator, label="Embedding-only (Zero-shot)")
+    last_eval_precision = hybrid_metrics.get("Precision") if hybrid_metrics else None
     
     # 7. Training Loop (InfoNCE + CSLS Mining)
     rounds = 20
@@ -978,18 +986,32 @@ def finetune(config_path="config/finetune.yaml"):
     
     print("\n=== Iterative Bootstrapping (LoRA + High-Confidence Promotion) ===")
 
+    precision_low_rounds = 0
+
     for r in range(rounds):
+        if pending_pairs:
+            if last_eval_precision is not None and last_eval_precision + precision_slack < min_precision_to_expand:
+                for pair in pending_pairs:
+                    remove_anchor_pair(pair)
+                print(f"  Reverted {len(pending_pairs)} pending pairs due to precision drop.")
+            pending_pairs = []
         allow_heatup = r < warmup_rounds
         allow_expansion = True
         gate_precision = None
         if not allow_heatup and hybrid_metrics:
             gate_precision = hybrid_metrics.get("Precision", 1.0)
-            if gate_precision < min_precision_to_expand:
+            if gate_precision + precision_slack < min_precision_to_expand:
+                precision_low_rounds += 1
+            else:
+                precision_low_rounds = 0
+            if precision_low_rounds >= precision_patience:
                 allow_expansion = False
                 print(
                     f"  Round {r+1}: Precision {gate_precision:.4f} < "
                     f"{min_precision_to_expand:.2f}, pause candidate expansion."
                 )
+        else:
+            precision_low_rounds = 0
 
         lexical_non_seed_count = sum(1 for p in current_anchors if anchor_origin.get(p) != "lexical")
         lexical_override_enabled = (
@@ -999,11 +1021,40 @@ def finetune(config_path="config/finetune.yaml"):
 
         # E-Step: Generate Candidates using CSLS + Structural Verification
         model.eval()
+        pending_round = []
         with torch.no_grad():
             h_src = run_model(model, text_proj, src_graph, device, adapter=src_adapter)
             h_tgt = run_model(model, text_proj, tgt_graph, device, adapter=tgt_adapter)
 
             anchor_map = {s: pair[1] for s, pair in source_anchor_map.items()}
+
+            def apply_structure_filter(raw_pairs, struct_scores_tensor, allow_relax):
+                if not raw_pairs:
+                    return []
+                if struct_scores_tensor is None:
+                    sorted_pairs = sorted(raw_pairs, key=lambda x: x[2], reverse=True)
+                    take_n = min(len(sorted_pairs), structure_min_success or len(sorted_pairs))
+                    return [((i, j, score), 0.0) for (i, j, score) in sorted_pairs[:take_n]]
+                scores = struct_scores_tensor.tolist() if hasattr(struct_scores_tensor, 'tolist') else struct_scores_tensor
+                def filter_by(threshold_value):
+                    return [
+                        ((i, j, score), sc)
+                        for (i, j, score), sc in zip(raw_pairs, scores)
+                        if sc >= threshold_value
+                    ]
+                filtered = filter_by(structure_threshold)
+                if not allow_relax:
+                    return filtered
+                if structure_min_success and len(filtered) < structure_min_success:
+                    relaxed_threshold = structure_threshold * structure_relax_factor
+                    relaxed = filter_by(relaxed_threshold) if relaxed_threshold < structure_threshold else []
+                    if relaxed:
+                        filtered = relaxed
+                if structure_min_success and len(filtered) < structure_min_success:
+                    sorted_pairs = sorted(raw_pairs, key=lambda x: x[2], reverse=True)
+                    take_n = min(len(sorted_pairs), structure_min_success)
+                    filtered = [((i, j, score), 0.0) for (i, j, score) in sorted_pairs[:take_n]]
+                return filtered
 
             csls_raw = []
             new_csls = []
@@ -1033,20 +1084,14 @@ def finetune(config_path="config/finetune.yaml"):
                 if csls_pairs:
                     need_structure = (r + 1) >= structure_warmup_rounds and len(anchor_map) >= structure_min_anchors
                     struct_scores = compute_jaccard_similarity(csls_pairs, adj_src, adj_tgt, anchor_map) if need_structure else None
-                    if struct_scores is None:
-                        struct_filtered = [((i, j, score), 0.0) for (i, j, score) in csls_raw]
-                    else:
-                        struct_filtered = [
-                            ((i, j, score), struct_score)
-                            for (i, j, score), struct_score in zip(csls_raw, struct_scores.tolist())
-                            if struct_score >= structure_threshold
-                        ]
+                    struct_filtered = apply_structure_filter(csls_raw, struct_scores, not need_structure)
 
                 for (i, j, score), _ in struct_filtered:
                     if budget_reached():
                         break
                     if add_anchor_pair((i, j), score, origin="csls"):
                         new_csls.append((i, j))
+                        pending_round.append((i, j))
                         added_this_round += 1
                         limit_hit = csls_max_pairs and len(new_csls) >= csls_max_pairs
                         if limit_hit or budget_reached():
@@ -1068,15 +1113,11 @@ def finetune(config_path="config/finetune.yaml"):
                         hc_pairs = [(i, j) for i, j, _ in high_conf_pairs]
                         need_structure = (r + 1) >= structure_warmup_rounds and len(anchor_map_for_struct) >= structure_min_anchors
                         struct_scores = compute_jaccard_similarity(hc_pairs, adj_src, adj_tgt, anchor_map_for_struct) if need_structure else None
-                        if struct_scores is None:
-                            filtered_iter = zip(high_conf_pairs, [0.0] * len(high_conf_pairs))
-                        else:
-                            filtered_iter = zip(high_conf_pairs, struct_scores.tolist())
-                        for (i, j, score), struct_score in filtered_iter:
-                            if struct_scores is not None and struct_score < structure_threshold:
-                                continue
+                        filtered_iter = apply_structure_filter(high_conf_pairs, struct_scores, not need_structure)
+                        for (i, j, score), _ in filtered_iter:
                             if add_anchor_pair((i, j), score, origin="high_conf"):
                                 new_high_conf.append((i, j))
+                                pending_round.append((i, j))
                                 added_this_round += 1
                                 limit_hit = high_conf_max_pairs and len(new_high_conf) >= high_conf_max_pairs
                                 if limit_hit or budget_reached():
@@ -1100,15 +1141,11 @@ def finetune(config_path="config/finetune.yaml"):
                         struct_scores = compute_jaccard_similarity(
                             emb_pairs, adj_src, adj_tgt, anchor_map_for_struct
                         ) if need_structure else None
-                        if struct_scores is None:
-                            filtered_iter = zip(embedding_candidates, [0.0] * len(embedding_candidates))
-                        else:
-                            filtered_iter = zip(embedding_candidates, struct_scores.tolist())
-                        for (i, j, score), struct_score in filtered_iter:
-                            if struct_scores is not None and struct_score < structure_threshold:
-                                continue
+                        filtered_iter = apply_structure_filter(embedding_candidates, struct_scores, not need_structure)
+                        for (i, j, score), _ in filtered_iter:
                             if add_anchor_pair((i, j), score, origin="embedding"):
                                 new_embedding.append((i, j))
+                                pending_round.append((i, j))
                                 added_this_round += 1
                                 limit_hit = embedding_max_pairs and len(new_embedding) >= embedding_max_pairs
                                 if limit_hit or budget_reached():
@@ -1136,6 +1173,8 @@ def finetune(config_path="config/finetune.yaml"):
             new_count = len([p for p in current_anchors if p not in lexical_seed_set])
             print(f"  Round {r+1}: Total new trusted pairs: {len(valid_new_pairs)}")
             print(f"  Round {r+1}: Training on {len(current_anchors)} pairs (Starts: {len(lexical_seeds)})")
+
+        pending_pairs = pending_round
 
         # M-Step: Train with Margin Ranking Loss
         model.train()
@@ -1192,7 +1231,7 @@ def finetune(config_path="config/finetune.yaml"):
             model.eval()
             h_s_eval = run_model(model, text_proj, src_graph, device, adapter=src_adapter)
             h_t_eval = run_model(model, text_proj, tgt_graph, device, adapter=tgt_adapter)
-            hybrid_metrics = evaluate_hybrid(src_graph, tgt_graph, h_s_eval, h_t_eval, lexical_seeds, evaluator)
+            hybrid_metrics = evaluate_hybrid(src_graph, tgt_graph, h_s_eval, h_t_eval, current_anchors, evaluator)
             evaluate_embeddings_only(
                 src_graph,
                 tgt_graph,
@@ -1201,6 +1240,7 @@ def finetune(config_path="config/finetune.yaml"):
                 evaluator,
                 label=f"Embedding-only (Round {r+1})"
             )
+            last_eval_precision = hybrid_metrics.get("Precision") if hybrid_metrics else last_eval_precision
 
     torch.save(model.state_dict(), "checkpoints/finetuned_infonce.pt")
     print("Saved to checkpoints/finetuned_infonce.pt")
