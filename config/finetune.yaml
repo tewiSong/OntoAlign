@@ -42,6 +42,6 @@ train:
   anchor_prune_threshold: 0.6
   anchor_replace_margin: 0.02
   lexical_override_threshold: 0.75
-  lexical_guard_rounds: 2
-  lexical_min_hits: 10
-  lexical_min_precision: 0.95
+  lexical_guard_rounds: 3
+  structure_warmup_rounds: 3
+  structure_min_anchors: 300

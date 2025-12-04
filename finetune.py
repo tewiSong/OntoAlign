@@ -327,11 +327,14 @@ def get_csls_mnn(
     adaptive=False,
     std_multiplier=1.5,
     min_threshold=None,
-    min_pairs=20
+    min_pairs=20,
+    src_filter=None,
+    tgt_filter=None
 ):
     """
     Get Mutual Nearest Neighbors based on CSLS score.
     Returns tuples (src_idx, tgt_idx, score).
+    Optional src_filter/tgt_filter: callables that return True if node is eligible.
     """
     csls_sim = compute_csls_sim(h_src, h_tgt, k=k)
 
@@ -360,16 +363,27 @@ def get_csls_mnn(
     print(f"  [DEBUG] Max Score Sample: {val_s2t[:5].tolist()}")
     print(f"  [DEBUG] Using CSLS threshold={used_threshold:.4f}")
 
+    def allow_pair(i, j, score):
+        if src_filter and not src_filter(i):
+            return False
+        if tgt_filter and not tgt_filter(j, score):
+            return False
+        return True
+
     pairs = []
     all_mnn = []
     for i in range(h_src.size(0)):
         j = idx_s2t[i].item()
         score = val_s2t[i].item()
+        if src_filter and not src_filter(i):
+            continue
+        if tgt_filter and not tgt_filter(j, score):
+            continue
 
         # Check Mutual Nearest
         if idx_t2s[j].item() == i:
             all_mnn.append((i, j, score))
-            if score > used_threshold:
+            if score > used_threshold and allow_pair(i, j, score):
                 pairs.append((i, j, score))
 
     if min_pairs and len(pairs) < min_pairs and all_mnn:
@@ -377,6 +391,8 @@ def get_csls_mnn(
         seen = {(i, j) for i, j, _ in pairs}
         for i, j, score in sorted(all_mnn, key=lambda x: x[2], reverse=True):
             if (i, j) in seen:
+                continue
+            if not allow_pair(i, j, score):
                 continue
             pairs.append((i, j, score))
             seen.add((i, j))
@@ -430,7 +446,7 @@ def prune_noisy_anchors(pairs, h_src, h_tgt, lexical_seed_set, min_score):
     return cleaned, removed_pairs
 
 # --- High-Confidence Promotion ---
-def get_embedding_topk_candidates(h_src, h_tgt, topk=50, min_score=0.5, margin=0.1):
+def get_embedding_topk_candidates(h_src, h_tgt, topk=50, min_score=0.5, margin=0.1, src_filter=None, tgt_filter=None):
     if topk <= 0 or min_score <= 0:
         return []
     src_emb = F.normalize(h_src, p=2, dim=1)
@@ -452,20 +468,26 @@ def get_embedding_topk_candidates(h_src, h_tgt, topk=50, min_score=0.5, margin=0
 
     candidates = []
     for r in rows.tolist():
+        if src_filter and not src_filter(int(r)):
+            continue
         j = int(idx[r, 0].item())
+        score = float(best[r].item())
         if idx_t[j].item() != r:
             continue
-        candidates.append((r, j, float(best[r].item())))
+        if tgt_filter and not tgt_filter(j, score):
+            continue
+        candidates.append((r, j, score))
 
     candidates.sort(key=lambda x: x[2], reverse=True)
     if topk < len(candidates):
         candidates = candidates[:topk]
     return candidates
 
-def get_high_conf_candidates(h_src, h_tgt, topk=50, min_score=0.3, margin=0.05):
+def get_high_conf_candidates(h_src, h_tgt, topk=50, min_score=0.3, margin=0.05, src_filter=None, tgt_filter=None):
     """
     Get high-confidence candidates using top-1 similarity with a margin over the runner-up.
     Returns tuples (src_idx, tgt_idx, score) sorted by score.
+    Optional filters can skip already-anchored nodes.
     """
     src_emb = F.normalize(h_src, p=2, dim=1)
     tgt_emb = F.normalize(h_tgt, p=2, dim=1)
@@ -490,7 +512,13 @@ def get_high_conf_candidates(h_src, h_tgt, topk=50, min_score=0.3, margin=0.05):
 
     candidates = []
     for r in rows.tolist():
-        candidates.append((int(r), int(idx[r, 0].item()), float(best[r].item())))
+        if src_filter and not src_filter(int(r)):
+            continue
+        j = int(idx[r, 0].item())
+        score = float(best[r].item())
+        if tgt_filter and not tgt_filter(j, score):
+            continue
+        candidates.append((int(r), j, score))
 
     candidates.sort(key=lambda x: x[2], reverse=True)
     return candidates
@@ -720,9 +748,9 @@ def finetune(config_path="config/finetune.yaml"):
     anchor_prune_threshold = train_cfg.get('anchor_prune_threshold', 0.6)
     anchor_replace_margin = train_cfg.get('anchor_replace_margin', 0.02)
     lexical_override_threshold = train_cfg.get('lexical_override_threshold', 0.75)
-    lexical_guard_rounds = train_cfg.get('lexical_guard_rounds', 2)
-    lexical_min_hits = train_cfg.get('lexical_min_hits', 10)
-    lexical_min_precision = train_cfg.get('lexical_min_precision', 0.95)
+    lexical_guard_rounds = train_cfg.get('lexical_guard_rounds', 3)
+    structure_warmup_rounds = train_cfg.get('structure_warmup_rounds', 3)
+    structure_min_anchors = train_cfg.get('structure_min_anchors', 300)
 
     
     # 1. Load Data
@@ -966,9 +994,7 @@ def finetune(config_path="config/finetune.yaml"):
         lexical_non_seed_count = sum(1 for p in current_anchors if anchor_origin.get(p) != "lexical")
         lexical_override_enabled = (
             (r + 1) >= lexical_guard_rounds
-            and lexical_non_seed_count >= lexical_min_hits
-            and hybrid_metrics is not None
-            and hybrid_metrics.get("Precision", 0.0) >= lexical_min_precision
+            and lexical_non_seed_count >= 1
         )
 
         # E-Step: Generate Candidates using CSLS + Structural Verification
@@ -998,17 +1024,23 @@ def finetune(config_path="config/finetune.yaml"):
                     adaptive=csls_adaptive,
                     std_multiplier=csls_std_multiplier,
                     min_threshold=csls_min_threshold,
-                    min_pairs=csls_min_pairs
+                    min_pairs=csls_min_pairs,
+                    src_filter=lambda i: source_anchor_map.get(i) is None or lexical_override_enabled,
+                    tgt_filter=lambda j, score: target_anchor_map.get(j) is None or lexical_override_enabled
                 )
                 csls_pairs = [(i, j) for i, j, _ in csls_raw]
                 struct_filtered = []
                 if csls_pairs:
-                    struct_scores = compute_jaccard_similarity(csls_pairs, adj_src, adj_tgt, anchor_map)
-                    struct_filtered = [
-                        ((i, j, score), struct_score)
-                        for (i, j, score), struct_score in zip(csls_raw, struct_scores.tolist())
-                        if struct_score >= structure_threshold
-                    ]
+                    need_structure = (r + 1) >= structure_warmup_rounds and len(anchor_map) >= structure_min_anchors
+                    struct_scores = compute_jaccard_similarity(csls_pairs, adj_src, adj_tgt, anchor_map) if need_structure else None
+                    if struct_scores is None:
+                        struct_filtered = [((i, j, score), 0.0) for (i, j, score) in csls_raw]
+                    else:
+                        struct_filtered = [
+                            ((i, j, score), struct_score)
+                            for (i, j, score), struct_score in zip(csls_raw, struct_scores.tolist())
+                            if struct_score >= structure_threshold
+                        ]
 
                 for (i, j, score), _ in struct_filtered:
                     if budget_reached():
@@ -1028,13 +1060,20 @@ def finetune(config_path="config/finetune.yaml"):
                         h_tgt,
                         topk=high_conf_topk,
                         min_score=high_conf_min_score,
-                        margin=high_conf_margin
+                        margin=high_conf_margin,
+                        src_filter=lambda i: source_anchor_map.get(i) is None or lexical_override_enabled,
+                        tgt_filter=lambda j, score: target_anchor_map.get(j) is None or lexical_override_enabled
                     )
                     if high_conf_pairs:
                         hc_pairs = [(i, j) for i, j, _ in high_conf_pairs]
-                        struct_scores = compute_jaccard_similarity(hc_pairs, adj_src, adj_tgt, anchor_map_for_struct)
-                        for (i, j, score), struct_score in zip(high_conf_pairs, struct_scores.tolist()):
-                            if struct_score < structure_threshold:
+                        need_structure = (r + 1) >= structure_warmup_rounds and len(anchor_map_for_struct) >= structure_min_anchors
+                        struct_scores = compute_jaccard_similarity(hc_pairs, adj_src, adj_tgt, anchor_map_for_struct) if need_structure else None
+                        if struct_scores is None:
+                            filtered_iter = zip(high_conf_pairs, [0.0] * len(high_conf_pairs))
+                        else:
+                            filtered_iter = zip(high_conf_pairs, struct_scores.tolist())
+                        for (i, j, score), struct_score in filtered_iter:
+                            if struct_scores is not None and struct_score < structure_threshold:
                                 continue
                             if add_anchor_pair((i, j), score, origin="high_conf"):
                                 new_high_conf.append((i, j))
@@ -1051,15 +1090,22 @@ def finetune(config_path="config/finetune.yaml"):
                         h_tgt,
                         topk=embedding_topk,
                         min_score=embedding_score_threshold,
-                        margin=embedding_margin
+                        margin=embedding_margin,
+                        src_filter=lambda i: source_anchor_map.get(i) is None or lexical_override_enabled,
+                        tgt_filter=lambda j, score: target_anchor_map.get(j) is None or lexical_override_enabled
                     )
                     if embedding_candidates:
                         emb_pairs = [(i, j) for i, j, _ in embedding_candidates]
+                        need_structure = (r + 1) >= structure_warmup_rounds and len(anchor_map_for_struct) >= structure_min_anchors
                         struct_scores = compute_jaccard_similarity(
                             emb_pairs, adj_src, adj_tgt, anchor_map_for_struct
-                        )
-                        for (i, j, score), struct_score in zip(embedding_candidates, struct_scores.tolist()):
-                            if struct_score < structure_threshold:
+                        ) if need_structure else None
+                        if struct_scores is None:
+                            filtered_iter = zip(embedding_candidates, [0.0] * len(embedding_candidates))
+                        else:
+                            filtered_iter = zip(embedding_candidates, struct_scores.tolist())
+                        for (i, j, score), struct_score in filtered_iter:
+                            if struct_scores is not None and struct_score < structure_threshold:
                                 continue
                             if add_anchor_pair((i, j), score, origin="embedding"):
                                 new_embedding.append((i, j))

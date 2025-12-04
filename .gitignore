@@ -1,6 +1,6 @@
 *.err
 *.out
-datasets/owls_align_pretrain/
+datasets/
 dcgm/
 graphs/
-checkpoints/pretrained_model_epoch_200.pt
+checkpoints/
